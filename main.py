@@ -9,6 +9,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
+# Add (after your other imports)
+from pyrogram import filters
+
+# Custom filter: True for non-edited messages
+non_edited = filters.create(lambda _, __, msg: not bool(getattr(msg, "edit_date", None)))
 
 load_dotenv()
 
@@ -327,7 +332,7 @@ async def cmd_rename(client: Client, message: Message):
         log.exception("Failed to rename/send: %s", e)
         await message.reply_text(f"Failed to rename/send file: {e}", quote=True)
 
-@app.on_message(filters.all & ~filters.edited)
+@app.on_message(filters.all & non_edited)
 async def auto_caption_rename(client: Client, message: Message):
     # If a user uploads a file with caption "rename: newname.ext [--thumb] [--as-video]", immediately reply with renamed file
     if not message.media:
