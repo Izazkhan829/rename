@@ -39,7 +39,8 @@ if MODE not in ("bot", "user"):
 if MODE == "bot":
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN required for bot mode")
-    app = Client("rename_bot", bot_token=BOT_TOKEN, workdir=".")
+      # new — use an in-memory session name so no .session file is loaded/created
+        app = Client(":memory:", bot_token=BOT_TOKEN, workdir=".")
 else:
     if not API_ID or not API_HASH:
         raise SystemExit("API_ID and API_HASH required for user mode")
