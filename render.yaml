@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: telegram-rename-bot
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    envVars:
+      - key: MODE
+        value: "bot" # or "user"
+      - key: BOT_TOKEN
+        value: ""
+      - key: API_ID
+        value: ""
+      - key: API_HASH
+        value: ""
+      - key: SESSION_NAME
+        value: "rename_user_session"
+      - key: SESSION_STRING
+        value: ""
+      - key: OWNER_IDS
+        value: ""
+      - key: ALLOW_GROUP_IDS
+        value: ""
