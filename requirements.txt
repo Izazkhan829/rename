@@ -1,0 +1,3 @@
+pyrogram[speed]>=2.0.30
+tgcrypto
+python-dotenv
