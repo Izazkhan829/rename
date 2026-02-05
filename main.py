@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
+"""
+Defensive main for Telegram rename bot.
+
+This file aggressively avoids accidental user-session authorization when run in bot mode:
+- Removes any .session files on startup (to prevent Pyrogram from loading them).
+- Forces an in-memory bot session (Client(":memory:", bot_token=...)) when MODE=bot.
+- Logs presence (but not values) of relevant env vars for troubleshooting.
+"""
 import os
+import sys
 import time
 import tempfile
 import shutil
@@ -11,9 +20,11 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("tg-rename-bot")
 
-# Config
-MODE = os.getenv("MODE", "bot").lower()  # "bot" or "user"
+# Read config
+MODE = os.getenv("MODE", "bot").lower()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_ID = os.getenv("API_ID", "")
 API_HASH = os.getenv("API_HASH", "")
@@ -23,39 +34,59 @@ SESSION_NAME = os.getenv("SESSION_NAME", "rename_user_session")
 OWNER_IDS = [int(x.strip()) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip().isdigit()]
 ALLOW_GROUP_IDS = [int(x.strip()) for x in os.getenv("ALLOW_GROUP_IDS", "").split(",") if x.strip().lstrip("-").isdigit()]
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("tg-rename-bot")
+# Debug: report presence of env keys (do NOT print values)
+log.info("Startup environment keys presence: MODE=%s BOT_TOKEN_SET=%s API_ID_SET=%s API_HASH_SET=%s SESSION_STRING_SET=%s SESSION_FILE_PATH_SET=%s",
+         MODE, bool(BOT_TOKEN), bool(API_ID), bool(API_HASH), bool(SESSION_STRING), bool(SESSION_FILE_PATH))
 
+# Defensive: remove leftover session files before creating client (only when running as bot)
+if MODE == "bot":
+    try:
+        sess_files = list(Path(".").glob("*.session"))
+        if sess_files:
+            log.info("Found %d .session file(s) at startup: %s", len(sess_files), [p.name for p in sess_files])
+        for p in sess_files:
+            try:
+                p.unlink()
+                log.info("Removed leftover session file: %s", p.name)
+            except Exception as exc:
+                log.warning("Could not remove session file %s: %s", p.name, exc)
+    except Exception as exc:
+        log.warning("Error while scanning/removing .session files: %s", exc)
+
+# Validate MODE
 if MODE not in ("bot", "user"):
-    raise SystemExit("MODE must be 'bot' or 'user'")
+    log.error("MODE must be 'bot' or 'user' - current: %s", MODE)
+    sys.exit(1)
 
-# Custom non-edited filter (some pyrogram versions lack filters.edited)
+# Custom non-edited filter for pyrogram versions without filters.edited
 non_edited = filters.create(lambda _, __, msg: not bool(getattr(msg, "edit_date", None)))
 
-# Create client (ensure app is defined BEFORE handlers)
+# Create client AFTER cleanup
 if MODE == "bot":
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN required for bot mode")
-    # Use in-memory session to avoid accidental user auth or .session file usage
+        log.error("BOT_TOKEN is required for bot mode. Set BOT_TOKEN in Render env.")
+        sys.exit(1)
+    # Force in-memory bot session to avoid reading/writing .session files
     app = Client(":memory:", bot_token=BOT_TOKEN, workdir=".")
 else:
+    # USER mode: we'll attempt to use session string first, then session file, then create a session normally.
     if not API_ID or not API_HASH:
-        raise SystemExit("API_ID and API_HASH required for user mode")
-    # Prefer session string (safe for Render secrets)
+        log.error("API_ID and API_HASH are required for user mode.")
+        sys.exit(1)
     if SESSION_STRING:
         app = Client(SESSION_NAME, api_id=int(API_ID), api_hash=API_HASH, session_string=SESSION_STRING, workdir=".")
     elif SESSION_FILE_PATH and os.path.exists(SESSION_FILE_PATH):
         dst = f"{SESSION_NAME}.session"
         try:
             shutil.copy(SESSION_FILE_PATH, dst)
+            log.info("Copied provided session file into working dir: %s", dst)
         except Exception as e:
             log.warning("Failed to copy session file: %s", e)
         app = Client(SESSION_NAME, api_id=int(API_ID), api_hash=API_HASH, workdir=".")
     else:
         app = Client(SESSION_NAME, api_id=int(API_ID), api_hash=API_HASH, workdir=".")
 
-# Helpers
+# Helper functions (unchanged)
 def humanbytes(size: float) -> str:
     if not size:
         return "0B"
@@ -138,10 +169,9 @@ def progress_callback_factory(status_message: Message, start_time: float, prefix
             pass
     return _progress
 
-# Core send logic
+# Core send logic (kept concise)
 async def send_with_filename(client: Client, chat_id: int, media_message: Message, new_filename: str, reply_to_message_id: int = None, keep_thumb: bool = False, as_video: bool = False):
     status = await client.send_message(chat_id, "Preparing rename...", reply_to_message_id=reply_to_message_id)
-    # collect thumb file_id if requested and available
     thumb_file_id = None
     try:
         if getattr(media_message, "document", None) and media_message.document.thumbs:
@@ -162,7 +192,6 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
     except Exception:
         thumb_file_id = None
 
-    # Try server-side copy in user mode (fast)
     if MODE == "user":
         try:
             file_id = None
@@ -203,7 +232,6 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
         except Exception as e:
             log.warning("Server-side copy failed, falling back to download/upload: %s", e)
 
-    # Fallback: download and upload with progress
     tmp_dir = tempfile.mkdtemp(prefix="tg_rename_")
     downloaded_path = None
     try:
@@ -258,7 +286,7 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
         except Exception:
             pass
 
-# Handlers (app is already created)
+# Handlers
 @app.on_message(filters.command("start") & filters.private)
 async def start_private(_, message: Message):
     await message.reply_text("Send a file and reply to it with /rename new_name.ext\nOr send a file with caption: rename: new_name.ext")
@@ -319,7 +347,6 @@ async def auto_caption_rename(client: Client, message: Message):
         log.exception("Auto-caption rename failed: %s", e)
         await message.reply_text(f"Failed to rename/send file: {e}", quote=True)
 
-# Optional admin-only shutdown
 @app.on_message(filters.command("shutdown") & (filters.private | filters.group))
 async def shutdown_cmd(client: Client, message: Message):
     from_user = message.from_user.id if message.from_user else None
@@ -331,4 +358,21 @@ async def shutdown_cmd(client: Client, message: Message):
 
 if __name__ == "__main__":
     log.info("Starting Telegram rename bot in %s mode", MODE)
-    app.run()
+    # Extra debug: list remaining .session files (should be none)
+    try:
+        remaining = [p.name for p in Path('.').glob('*.session')]
+        log.info("Remaining .session files at final startup step: %s", remaining)
+    except Exception:
+        pass
+    try:
+        app.run()
+    except Exception as e:
+        # Log contextual info to help debug why pyrogram tried user auth
+        log.exception("App failed to start: %s", e)
+        log.info("ENV PRESENCE: BOT_TOKEN_SET=%s API_ID_SET=%s API_HASH_SET=%s SESSION_STRING_SET=%s SESSION_FILE_PATH_SET=%s",
+                 bool(BOT_TOKEN), bool(API_ID), bool(API_HASH), bool(SESSION_STRING), bool(SESSION_FILE_PATH))
+        try:
+            log.info("Session files at failure time: %s", [p.name for p in Path('.').glob('*.session')])
+        except Exception:
+            pass
+        raise
