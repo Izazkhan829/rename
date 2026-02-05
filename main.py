@@ -9,11 +9,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
-# Add (after your other imports)
-from pyrogram import filters
-
-# Custom filter: True for non-edited messages
-non_edited = filters.create(lambda _, __, msg: not bool(getattr(msg, "edit_date", None)))
 
 load_dotenv()
 
@@ -35,23 +30,22 @@ log = logging.getLogger("tg-rename-bot")
 if MODE not in ("bot", "user"):
     raise SystemExit("MODE must be 'bot' or 'user'")
 
-# Create client
+# Custom non-edited filter (some pyrogram versions lack filters.edited)
+non_edited = filters.create(lambda _, __, msg: not bool(getattr(msg, "edit_date", None)))
+
+# Create client (ensure app is defined BEFORE handlers)
 if MODE == "bot":
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN required for bot mode")
-      # new — use an in-memory session name so no .session file is loaded/created
-        app = Client(":memory:", bot_token=BOT_TOKEN, workdir=".")
+    # Use in-memory session to avoid accidental user auth or .session file usage
+    app = Client(":memory:", bot_token=BOT_TOKEN, workdir=".")
 else:
     if not API_ID or not API_HASH:
         raise SystemExit("API_ID and API_HASH required for user mode")
-    client_kwargs = {"api_id": int(API_ID), "api_hash": API_HASH, "workdir": "."}
-    # Prefer session string for Render-friendly flow
+    # Prefer session string (safe for Render secrets)
     if SESSION_STRING:
-        # Pyrogram supports session_string parameter via session_name/session_string
-        # Provide session_name as identifier and session_string to init
         app = Client(SESSION_NAME, api_id=int(API_ID), api_hash=API_HASH, session_string=SESSION_STRING, workdir=".")
     elif SESSION_FILE_PATH and os.path.exists(SESSION_FILE_PATH):
-        # copy mounted session file into working dir so Pyrogram can use it
         dst = f"{SESSION_NAME}.session"
         try:
             shutil.copy(SESSION_FILE_PATH, dst)
@@ -84,19 +78,10 @@ def is_allowed_chat(chat_id: int) -> bool:
     return chat_id in ALLOW_GROUP_IDS
 
 def extract_newname_and_flags(text: str):
-    """
-    Robust extraction of new filename and flags from:
-     - "/rename newname.ext --thumb --as-video"
-     - "rename: newname.ext --thumb"
-     - caption content with flags
-    Returns (name_or_None, flags_list)
-    """
     if not text:
         return None, []
     text = text.strip()
-    # normalize multiple whitespace
     tokens = text.split()
-    # detect "rename:" anywhere
     lower = text.lower()
     flags = []
     name_tokens = []
@@ -107,21 +92,17 @@ def extract_newname_and_flags(text: str):
         flags = [t for t in tail_tokens if t.startswith("--")]
         name_tokens = [t for t in tail_tokens if not t.startswith("--")]
     elif tokens and tokens[0].lower().startswith("/rename"):
-        # /rename possibly with leading /rename or /rename@
         tokens_tail = tokens[1:]
         flags = [t for t in tokens_tail if t.startswith("--")]
         name_tokens = [t for t in tokens_tail if not t.startswith("--")]
+    elif lower.startswith("rename="):
+        tail = text.split("=", 1)[1].strip()
+        tail_tokens = tail.split()
+        flags = [t for t in tail_tokens if t.startswith("--")]
+        name_tokens = [t for t in tail_tokens if not t.startswith("--")]
     else:
-        # fallback: if it looks like a single filename or starts with "rename="
-        if lower.startswith("rename="):
-            tail = text.split("=", 1)[1].strip()
-            tail_tokens = tail.split()
-            flags = [t for t in tail_tokens if t.startswith("--")]
-            name_tokens = [t for t in tail_tokens if not t.startswith("--")]
-        else:
-            # naive: first non-flag tokens are name
-            flags = [t for t in tokens if t.startswith("--")]
-            name_tokens = [t for t in tokens if not t.startswith("--")]
+        flags = [t for t in tokens if t.startswith("--")]
+        name_tokens = [t for t in tokens if not t.startswith("--")]
     name = " ".join(name_tokens).strip()
     if not name:
         return None, flags
@@ -135,10 +116,8 @@ async def edit_status_safe(msg: Message, txt: str):
 
 def progress_callback_factory(status_message: Message, start_time: float, prefix: str = ""):
     last_update = {"time": 0}
-
     def _progress(current, total):
         now = time.time()
-        # throttle updates to ~1s
         if now - last_update["time"] < 1 and current != total:
             return
         last_update["time"] = now
@@ -157,20 +136,11 @@ def progress_callback_factory(status_message: Message, start_time: float, prefix
             asyncio.get_event_loop().create_task(edit_status_safe(status_message, text))
         except Exception:
             pass
-
     return _progress
 
-# Core sending logic
+# Core send logic
 async def send_with_filename(client: Client, chat_id: int, media_message: Message, new_filename: str, reply_to_message_id: int = None, keep_thumb: bool = False, as_video: bool = False):
-    """
-    Attempt to send the file with a new filename.
-    Strategy:
-     - If MODE=user and file_id is available, attempt server-side copy using file_id (fast).
-     - Otherwise, download to temp and upload with progress and optional thumb/as_video handling.
-    """
     status = await client.send_message(chat_id, "Preparing rename...", reply_to_message_id=reply_to_message_id)
-    start = time.time()
-
     # collect thumb file_id if requested and available
     thumb_file_id = None
     try:
@@ -186,17 +156,15 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
                 thumb_file_id = None
         if getattr(media_message, "photo", None):
             try:
-                # choose the largest size
                 thumb_file_id = media_message.photo.file_id
             except Exception:
                 thumb_file_id = None
     except Exception:
         thumb_file_id = None
 
-    # Try fast server-side copy for USER mode
+    # Try server-side copy in user mode (fast)
     if MODE == "user":
         try:
-            # get appropriate file_id
             file_id = None
             if getattr(media_message, "document", None):
                 file_id = media_message.document.file_id
@@ -211,10 +179,7 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
 
             if file_id:
                 await status.edit_text("Copying file on Telegram servers (fast)...")
-                # For documents, we can pass file_name to set the filename when sending as document
-                # Pyrogram will instruct Telegram to copy the file by id
                 if as_video and getattr(media_message, "video", None):
-                    # When forcing as video, we copy video; filename control is limited for video
                     await client.send_video(
                         chat_id,
                         file_id,
@@ -223,7 +188,6 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
                         reply_to_message_id=reply_to_message_id,
                     )
                 else:
-                    # Send as document to control filename
                     await client.send_document(
                         chat_id,
                         file_id,
@@ -239,7 +203,7 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
         except Exception as e:
             log.warning("Server-side copy failed, falling back to download/upload: %s", e)
 
-    # Fallback: download then upload with progress
+    # Fallback: download and upload with progress
     tmp_dir = tempfile.mkdtemp(prefix="tg_rename_")
     downloaded_path = None
     try:
@@ -252,7 +216,6 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
         await status.edit_text("Upload: starting...")
         start_ul = time.time()
         progress_cb_up = progress_callback_factory(status, start_ul, prefix="Uploading...")
-        # Choose send method
         try:
             if getattr(media_message, "video", None) and as_video:
                 await client.send_video(
@@ -295,14 +258,13 @@ async def send_with_filename(client: Client, chat_id: int, media_message: Messag
         except Exception:
             pass
 
-# Command handlers
+# Handlers (app is already created)
 @app.on_message(filters.command("start") & filters.private)
 async def start_private(_, message: Message):
     await message.reply_text("Send a file and reply to it with /rename new_name.ext\nOr send a file with caption: rename: new_name.ext")
 
 @app.on_message(filters.command("rename") & (filters.private | filters.group))
 async def cmd_rename(client: Client, message: Message):
-    # Permission checks
     from_user = message.from_user.id if message.from_user else None
     if not is_allowed_user(from_user):
         await message.reply_text("You are not authorized to use this bot.")
@@ -310,7 +272,6 @@ async def cmd_rename(client: Client, message: Message):
     if message.chat.type in ("group", "supergroup") and not is_allowed_chat(message.chat.id):
         await message.reply_text("This group is not allowed to use the bot.")
         return
-
     if not message.reply_to_message:
         await message.reply_text("Please reply to the file you want to rename with `/rename new_name.ext`.", quote=True)
         return
@@ -327,7 +288,6 @@ async def cmd_rename(client: Client, message: Message):
     await message.chat.do("typing")
     try:
         await send_with_filename(client, message.chat.id, media_msg, newname, reply_to_message_id=message.reply_to_message.message_id, keep_thumb=keep_thumb, as_video=as_video)
-        # confirm to user
         await message.reply_text(f"Renamed and sent as `{newname}`", quote=True)
     except Exception as e:
         log.exception("Failed to rename/send: %s", e)
@@ -335,22 +295,18 @@ async def cmd_rename(client: Client, message: Message):
 
 @app.on_message(filters.all & non_edited)
 async def auto_caption_rename(client: Client, message: Message):
-    # If a user uploads a file with caption "rename: newname.ext [--thumb] [--as-video]", immediately reply with renamed file
     if not message.media:
         return
     caption = message.caption or ""
     if "rename:" not in caption.lower():
         return
-    # permission checks for the sender
     from_user = message.from_user.id if message.from_user else None
     if not is_allowed_user(from_user):
-        # optionally inform sender (silently ignore to avoid spam?) => we'll inform
         await message.reply_text("You are not authorized to use this bot.")
         return
     if message.chat.type in ("group", "supergroup") and not is_allowed_chat(message.chat.id):
         await message.reply_text("This group is not allowed to use the bot.")
         return
-
     newname, flags = extract_newname_and_flags(caption)
     if not newname:
         return
@@ -358,13 +314,12 @@ async def auto_caption_rename(client: Client, message: Message):
     as_video = "--as-video" in flags
     try:
         await send_with_filename(client, message.chat.id, message, newname, reply_to_message_id=message.message_id, keep_thumb=keep_thumb, as_video=as_video)
-        # Optionally send a confirmation reply
         await message.reply_text(f"Renamed and sent as `{newname}`", quote=True)
     except Exception as e:
         log.exception("Auto-caption rename failed: %s", e)
         await message.reply_text(f"Failed to rename/send file: {e}", quote=True)
 
-# Optional admin-only shutdown command (only OWNER_IDS can call)
+# Optional admin-only shutdown
 @app.on_message(filters.command("shutdown") & (filters.private | filters.group))
 async def shutdown_cmd(client: Client, message: Message):
     from_user = message.from_user.id if message.from_user else None
@@ -373,7 +328,6 @@ async def shutdown_cmd(client: Client, message: Message):
         return
     await message.reply_text("Shutting down...")
     await client.stop()
-    # process will exit after stop
 
 if __name__ == "__main__":
     log.info("Starting Telegram rename bot in %s mode", MODE)
